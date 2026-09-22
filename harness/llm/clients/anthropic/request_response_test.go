@@ -46,7 +46,7 @@ func TestRequestParamsConvertsConversation(t *testing.T) {
 	if body["model"] != "claude-test" || body["max_tokens"] != float64(4096) {
 		t.Fatalf("model request = %s", encoded)
 	}
-	if body["cache_control"].(map[string]any)["type"] != "ephemeral" || body["output_config"].(map[string]any)["effort"] != "xhigh" ||
+	if body["cache_control"].(map[string]any)["type"] != "ephemeral" || body["output_config"].(map[string]any)["effort"] != "max" ||
 		body["thinking"].(map[string]any)["type"] != "adaptive" {
 		t.Fatalf("cache/effort = %s", encoded)
 	}
@@ -110,7 +110,7 @@ func TestRequestParamsNormalizesRepeatedToolResults(t *testing.T) {
 	}
 }
 
-func TestRequestParamsNormalizesDelayedToolResult(t *testing.T) {
+func TestRequestParamsPlacesCurrentResultBeforeInterveningInput(t *testing.T) {
 	params, err := requestParams(llm.Request{
 		Model: llm.Model{ID: "claude-test"},
 		Input: []llm.Item{
@@ -133,10 +133,41 @@ func TestRequestParamsNormalizesDelayedToolResult(t *testing.T) {
 	}
 	messages := body["messages"].([]any)
 	content := messages[len(messages)-1].(map[string]any)["content"].([]any)
-	for _, block := range content {
-		if block.(map[string]any)["type"] == "tool_result" {
-			t.Fatalf("delayed result remained a tool_result: %s", encoded)
-		}
+	if len(content) != 2 || content[0].(map[string]any)["type"] != "tool_result" ||
+		content[1].(map[string]any)["text"] != "intervening input" {
+		t.Fatalf("current result was not placed first: %s", encoded)
+	}
+}
+
+func TestRequestParamsPlacesCurrentResultsBeforeDelayedUpdates(t *testing.T) {
+	params, err := requestParams(llm.Request{
+		Model: llm.Model{ID: "claude-test"},
+		Input: []llm.Item{
+			{Type: llm.ItemMessage, Data: llm.Message{Role: llm.RoleUser, Text: "start"}},
+			{Type: llm.ItemToolCall, Data: llm.ToolCall{CallID: "toolu_old", Name: "Bash", Arguments: `{}`}},
+			{Type: llm.ItemToolResult, Data: llm.ToolResult{CallID: "toolu_old", Output: []llm.ToolResultOutput{{Kind: llm.ToolResultText, Value: "still running"}}}},
+			{Type: llm.ItemToolCall, Data: llm.ToolCall{CallID: "toolu_current", Name: "Bash", Arguments: `{}`}},
+			{Type: llm.ItemToolResult, Data: llm.ToolResult{CallID: "toolu_old", Output: []llm.ToolResultOutput{{Kind: llm.ToolResultText, Value: "old completed"}}}},
+			{Type: llm.ItemToolResult, Data: llm.ToolResult{CallID: "toolu_current", Output: []llm.ToolResultOutput{{Kind: llm.ToolResultText, Value: "current running"}}}},
+		},
+	}, llm.RequestOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	encoded, err := json.Marshal(params)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var body map[string]any
+	if err := json.Unmarshal(encoded, &body); err != nil {
+		t.Fatal(err)
+	}
+	messages := body["messages"].([]any)
+	content := messages[len(messages)-1].(map[string]any)["content"].([]any)
+	if len(content) != 3 || content[0].(map[string]any)["type"] != "tool_result" ||
+		content[0].(map[string]any)["tool_use_id"] != "toolu_current" ||
+		content[1].(map[string]any)["type"] != "text" || content[2].(map[string]any)["text"] != "old completed" {
+		t.Fatalf("result/update ordering = %s", encoded)
 	}
 }
 

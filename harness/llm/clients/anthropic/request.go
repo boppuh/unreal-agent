@@ -47,7 +47,11 @@ func requestParams(request llm.Request, options llm.RequestOptions) (anthropicsd
 		if !request.Model.ReasoningEffort.Valid() {
 			return anthropicsdk.MessageNewParams{}, fmt.Errorf("unsupported reasoning effort %q", request.Model.ReasoningEffort)
 		}
-		params.OutputConfig.Effort = anthropicsdk.OutputConfigEffort(request.Model.ReasoningEffort)
+		effort := request.Model.ReasoningEffort
+		if effort == llm.ReasoningEffortXHigh {
+			effort = llm.ReasoningEffortMax
+		}
+		params.OutputConfig.Effort = anthropicsdk.OutputConfigEffort(effort)
 		params.Thinking = anthropicsdk.ThinkingConfigParamUnion{
 			OfAdaptive: &anthropicsdk.ThinkingConfigAdaptiveParam{},
 		}
@@ -68,15 +72,24 @@ func requestMessages(items []llm.Item) ([]anthropicsdk.MessageParam, []anthropic
 			}
 			callMessage, knownCall := toolCalls[result.CallID]
 			_, alreadyDelivered := deliveredResults[result.CallID]
-			if !knownCall || alreadyDelivered || !canAppendToolResult(messages, callMessage) {
-				blocks, err := requestToolResultUpdate(result)
+			if knownCall && !alreadyDelivered {
+				block, err := requestToolResult(result)
 				if err != nil {
 					return nil, nil, fmt.Errorf("input item %d: %w", index, err)
 				}
-				messages = appendMessageBlocks(messages, anthropicsdk.MessageParamRoleUser, blocks...)
-				continue
+				var placed bool
+				messages, placed = placeToolResult(messages, callMessage, block)
+				if placed {
+					deliveredResults[result.CallID] = struct{}{}
+					continue
+				}
 			}
-			deliveredResults[result.CallID] = struct{}{}
+			blocks, err := requestToolResultUpdate(result)
+			if err != nil {
+				return nil, nil, fmt.Errorf("input item %d: %w", index, err)
+			}
+			messages = appendMessageBlocks(messages, anthropicsdk.MessageParamRoleUser, blocks...)
+			continue
 		}
 		role, block, systemBlock, err := requestItem(item)
 		if err != nil {
@@ -94,18 +107,31 @@ func requestMessages(items []llm.Item) ([]anthropicsdk.MessageParam, []anthropic
 	return messages, system, nil
 }
 
-func canAppendToolResult(messages []anthropicsdk.MessageParam, callMessage int) bool {
+func placeToolResult(
+	messages []anthropicsdk.MessageParam,
+	callMessage int,
+	block anthropicsdk.ContentBlockParamUnion,
+) ([]anthropicsdk.MessageParam, bool) {
 	preceding := len(messages) - 1
 	if preceding >= 0 && messages[preceding].Role == anthropicsdk.MessageParamRoleUser {
-		for _, block := range messages[preceding].Content {
-			if block.OfToolResult == nil {
-				return false
-			}
-		}
 		preceding--
 	}
-	return preceding == callMessage && preceding >= 0 &&
-		messages[preceding].Role == anthropicsdk.MessageParamRoleAssistant
+	if preceding != callMessage || preceding < 0 || messages[preceding].Role != anthropicsdk.MessageParamRoleAssistant {
+		return messages, false
+	}
+	if preceding == len(messages)-1 {
+		return appendMessageBlocks(messages, anthropicsdk.MessageParamRoleUser, block), true
+	}
+	content := messages[len(messages)-1].Content
+	position := 0
+	for position < len(content) && content[position].OfToolResult != nil {
+		position++
+	}
+	content = append(content, anthropicsdk.ContentBlockParamUnion{})
+	copy(content[position+1:], content[position:])
+	content[position] = block
+	messages[len(messages)-1].Content = content
+	return messages, true
 }
 
 func appendMessageBlocks(messages []anthropicsdk.MessageParam, role anthropicsdk.MessageParamRole, blocks ...anthropicsdk.ContentBlockParamUnion) []anthropicsdk.MessageParam {
