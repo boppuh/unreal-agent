@@ -2,6 +2,7 @@ package anthropic
 
 import (
 	"encoding/json/jsontext"
+	"encoding/json/v2"
 	"fmt"
 
 	anthropicsdk "github.com/anthropics/anthropic-sdk-go"
@@ -16,7 +17,7 @@ func response(source anthropicsdk.Message) (llm.Response, error) {
 	converted := llm.Response{
 		ID:    source.ID,
 		Stop:  stop,
-		Usage: responseUsage(source.Usage),
+		Usage: responseUsage(source),
 	}
 	converted.Output = make([]llm.Item, 0, len(source.Content))
 	for index, block := range source.Content {
@@ -47,7 +48,10 @@ func responseItem(messageID string, index int, block anthropicsdk.ContentBlockUn
 			},
 		}, nil
 	case "thinking", "redacted_thinking":
-		raw := jsontext.Value(append([]byte(nil), block.RawJSON()...))
+		raw, err := responseReasoningRaw(block)
+		if err != nil {
+			return llm.Item{}, err
+		}
 		reasoning := llm.Reasoning{Raw: raw}
 		if block.Type == "thinking" && block.Thinking != "" {
 			reasoning.Summary = []string{block.Thinking}
@@ -60,6 +64,30 @@ func responseItem(messageID string, index int, block anthropicsdk.ContentBlockUn
 	default:
 		return llm.Item{}, fmt.Errorf("unsupported Anthropic content block type %q", block.Type)
 	}
+}
+
+func responseReasoningRaw(block anthropicsdk.ContentBlockUnion) (jsontext.Value, error) {
+	var value any
+	switch block.Type {
+	case "thinking":
+		value = struct {
+			Type      string `json:"type"`
+			Thinking  string `json:"thinking"`
+			Signature string `json:"signature"`
+		}{Type: block.Type, Thinking: block.Thinking, Signature: block.Signature}
+	case "redacted_thinking":
+		value = struct {
+			Type string `json:"type"`
+			Data string `json:"data"`
+		}{Type: block.Type, Data: block.Data}
+	default:
+		return nil, fmt.Errorf("unsupported Anthropic reasoning content block type %q", block.Type)
+	}
+	encoded, err := json.Marshal(value)
+	if err != nil {
+		return nil, fmt.Errorf("encode Anthropic reasoning content block: %w", err)
+	}
+	return jsontext.Value(encoded), nil
 }
 
 func responseStop(source anthropicsdk.StopReason) (llm.StopReason, error) {
@@ -78,13 +106,20 @@ func responseStop(source anthropicsdk.StopReason) (llm.StopReason, error) {
 	}
 }
 
-func responseUsage(source anthropicsdk.Usage) llm.Usage {
+func responseUsage(source anthropicsdk.Message) llm.Usage {
+	raw := jsontext.Value(append([]byte(nil), source.Usage.RawJSON()...))
+	var envelope struct {
+		Usage jsontext.Value `json:"usage"`
+	}
+	if err := json.Unmarshal([]byte(source.RawJSON()), &envelope); err == nil && len(envelope.Usage) != 0 {
+		raw = jsontext.Value(append([]byte(nil), envelope.Usage...))
+	}
 	return llm.Usage{
-		InputTokens:           source.InputTokens + source.CacheCreationInputTokens + source.CacheReadInputTokens,
-		CachedInputTokens:     source.CacheReadInputTokens,
-		CacheWriteInputTokens: source.CacheCreationInputTokens,
-		OutputTokens:          source.OutputTokens,
-		ReasoningTokens:       source.OutputTokensDetails.ThinkingTokens,
-		Raw:                   jsontext.Value(append([]byte(nil), source.RawJSON()...)),
+		InputTokens:           source.Usage.InputTokens + source.Usage.CacheCreationInputTokens + source.Usage.CacheReadInputTokens,
+		CachedInputTokens:     source.Usage.CacheReadInputTokens,
+		CacheWriteInputTokens: source.Usage.CacheCreationInputTokens,
+		OutputTokens:          source.Usage.OutputTokens,
+		ReasoningTokens:       source.Usage.OutputTokensDetails.ThinkingTokens,
+		Raw:                   raw,
 	}
 }

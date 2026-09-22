@@ -46,7 +46,8 @@ func TestRequestParamsConvertsConversation(t *testing.T) {
 	if body["model"] != "claude-test" || body["max_tokens"] != float64(4096) {
 		t.Fatalf("model request = %s", encoded)
 	}
-	if body["cache_control"].(map[string]any)["type"] != "ephemeral" || body["output_config"].(map[string]any)["effort"] != "xhigh" {
+	if body["cache_control"].(map[string]any)["type"] != "ephemeral" || body["output_config"].(map[string]any)["effort"] != "xhigh" ||
+		body["thinking"].(map[string]any)["type"] != "adaptive" {
 		t.Fatalf("cache/effort = %s", encoded)
 	}
 	system := body["system"].([]any)
@@ -69,6 +70,73 @@ func TestRequestParamsConvertsConversation(t *testing.T) {
 	tools := body["tools"].([]any)
 	if len(tools) != 1 || tools[0].(map[string]any)["description"] != "Run a command" {
 		t.Fatalf("tools = %#v", tools)
+	}
+}
+
+func TestRequestParamsNormalizesRepeatedToolResults(t *testing.T) {
+	params, err := requestParams(llm.Request{
+		Model: llm.Model{ID: "claude-test"},
+		Input: []llm.Item{
+			{Type: llm.ItemMessage, Data: llm.Message{Role: llm.RoleUser, Text: "start"}},
+			{Type: llm.ItemToolCall, Data: llm.ToolCall{CallID: "toolu_1", Name: "Bash", Arguments: `{}`}},
+			{Type: llm.ItemToolResult, Data: llm.ToolResult{CallID: "toolu_1", Output: []llm.ToolResultOutput{{Kind: llm.ToolResultText, Value: "still running"}}}},
+			{Type: llm.ItemMessage, Data: llm.Message{Role: llm.RoleAssistant, Text: "I will continue."}},
+			{Type: llm.ItemToolResult, Data: llm.ToolResult{CallID: "toolu_1", Output: []llm.ToolResultOutput{{Kind: llm.ToolResultText, Value: "completed"}}}},
+		},
+	}, llm.RequestOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	encoded, err := json.Marshal(params)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var body map[string]any
+	if err := json.Unmarshal(encoded, &body); err != nil {
+		t.Fatal(err)
+	}
+	messages := body["messages"].([]any)
+	if len(messages) != 5 {
+		t.Fatalf("messages = %s", encoded)
+	}
+	firstResult := messages[2].(map[string]any)["content"].([]any)
+	if len(firstResult) != 1 || firstResult[0].(map[string]any)["type"] != "tool_result" {
+		t.Fatalf("first result = %#v", firstResult)
+	}
+	followUp := messages[4].(map[string]any)["content"].([]any)
+	if len(followUp) != 2 || followUp[0].(map[string]any)["type"] != "text" ||
+		followUp[1].(map[string]any)["text"] != "completed" {
+		t.Fatalf("follow-up result = %#v", followUp)
+	}
+}
+
+func TestRequestParamsNormalizesDelayedToolResult(t *testing.T) {
+	params, err := requestParams(llm.Request{
+		Model: llm.Model{ID: "claude-test"},
+		Input: []llm.Item{
+			{Type: llm.ItemMessage, Data: llm.Message{Role: llm.RoleUser, Text: "start"}},
+			{Type: llm.ItemToolCall, Data: llm.ToolCall{CallID: "toolu_1", Name: "Bash", Arguments: `{}`}},
+			{Type: llm.ItemMessage, Data: llm.Message{Role: llm.RoleUser, Text: "intervening input"}},
+			{Type: llm.ItemToolResult, Data: llm.ToolResult{CallID: "toolu_1", Output: []llm.ToolResultOutput{{Kind: llm.ToolResultText, Value: "completed"}}}},
+		},
+	}, llm.RequestOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	encoded, err := json.Marshal(params)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var body map[string]any
+	if err := json.Unmarshal(encoded, &body); err != nil {
+		t.Fatal(err)
+	}
+	messages := body["messages"].([]any)
+	content := messages[len(messages)-1].(map[string]any)["content"].([]any)
+	for _, block := range content {
+		if block.(map[string]any)["type"] == "tool_result" {
+			t.Fatalf("delayed result remained a tool_result: %s", encoded)
+		}
 	}
 }
 

@@ -48,6 +48,9 @@ func requestParams(request llm.Request, options llm.RequestOptions) (anthropicsd
 			return anthropicsdk.MessageNewParams{}, fmt.Errorf("unsupported reasoning effort %q", request.Model.ReasoningEffort)
 		}
 		params.OutputConfig.Effort = anthropicsdk.OutputConfigEffort(request.Model.ReasoningEffort)
+		params.Thinking = anthropicsdk.ThinkingConfigParamUnion{
+			OfAdaptive: &anthropicsdk.ThinkingConfigAdaptiveParam{},
+		}
 	}
 	return params, nil
 }
@@ -55,7 +58,26 @@ func requestParams(request llm.Request, options llm.RequestOptions) (anthropicsd
 func requestMessages(items []llm.Item) ([]anthropicsdk.MessageParam, []anthropicsdk.TextBlockParam, error) {
 	var messages []anthropicsdk.MessageParam
 	var system []anthropicsdk.TextBlockParam
+	toolCalls := make(map[string]int)
+	deliveredResults := make(map[string]struct{})
 	for index, item := range items {
+		if item.Type == llm.ItemToolResult {
+			result, ok := item.Data.(llm.ToolResult)
+			if !ok {
+				return nil, nil, fmt.Errorf("input item %d: tool result data must be llm.ToolResult, got %T", index, item.Data)
+			}
+			callMessage, knownCall := toolCalls[result.CallID]
+			_, alreadyDelivered := deliveredResults[result.CallID]
+			if !knownCall || alreadyDelivered || !canAppendToolResult(messages, callMessage) {
+				blocks, err := requestToolResultUpdate(result)
+				if err != nil {
+					return nil, nil, fmt.Errorf("input item %d: %w", index, err)
+				}
+				messages = appendMessageBlocks(messages, anthropicsdk.MessageParamRoleUser, blocks...)
+				continue
+			}
+			deliveredResults[result.CallID] = struct{}{}
+		}
 		role, block, systemBlock, err := requestItem(item)
 		if err != nil {
 			return nil, nil, fmt.Errorf("input item %d: %w", index, err)
@@ -64,13 +86,34 @@ func requestMessages(items []llm.Item) ([]anthropicsdk.MessageParam, []anthropic
 			system = append(system, *systemBlock)
 			continue
 		}
-		if len(messages) != 0 && messages[len(messages)-1].Role == role {
-			messages[len(messages)-1].Content = append(messages[len(messages)-1].Content, block)
-			continue
+		messages = appendMessageBlocks(messages, role, block)
+		if item.Type == llm.ItemToolCall {
+			toolCalls[item.Data.(llm.ToolCall).CallID] = len(messages) - 1
 		}
-		messages = append(messages, anthropicsdk.MessageParam{Role: role, Content: []anthropicsdk.ContentBlockParamUnion{block}})
 	}
 	return messages, system, nil
+}
+
+func canAppendToolResult(messages []anthropicsdk.MessageParam, callMessage int) bool {
+	preceding := len(messages) - 1
+	if preceding >= 0 && messages[preceding].Role == anthropicsdk.MessageParamRoleUser {
+		for _, block := range messages[preceding].Content {
+			if block.OfToolResult == nil {
+				return false
+			}
+		}
+		preceding--
+	}
+	return preceding == callMessage && preceding >= 0 &&
+		messages[preceding].Role == anthropicsdk.MessageParamRoleAssistant
+}
+
+func appendMessageBlocks(messages []anthropicsdk.MessageParam, role anthropicsdk.MessageParamRole, blocks ...anthropicsdk.ContentBlockParamUnion) []anthropicsdk.MessageParam {
+	if len(messages) != 0 && messages[len(messages)-1].Role == role {
+		messages[len(messages)-1].Content = append(messages[len(messages)-1].Content, blocks...)
+		return messages
+	}
+	return append(messages, anthropicsdk.MessageParam{Role: role, Content: blocks})
 }
 
 func requestItem(item llm.Item) (anthropicsdk.MessageParamRole, anthropicsdk.ContentBlockParamUnion, *anthropicsdk.TextBlockParam, error) {
@@ -165,6 +208,28 @@ func requestToolResult(result llm.ToolResult) (anthropicsdk.ContentBlockParamUni
 	}
 	block := anthropicsdk.ToolResultBlockParam{ToolUseID: result.CallID, Content: content}
 	return anthropicsdk.ContentBlockParamUnion{OfToolResult: &block}, nil
+}
+
+func requestToolResultUpdate(result llm.ToolResult) ([]anthropicsdk.ContentBlockParamUnion, error) {
+	blocks := []anthropicsdk.ContentBlockParamUnion{anthropicsdk.NewTextBlock(fmt.Sprintf(
+		"Follow-up result for tool call %q; the original tool result was already delivered:",
+		result.CallID,
+	))}
+	for index, part := range result.Output {
+		switch part.Kind {
+		case llm.ToolResultText:
+			blocks = append(blocks, anthropicsdk.NewTextBlock(part.Value))
+		case llm.ToolResultImage:
+			image, err := requestImage(part.Value)
+			if err != nil {
+				return nil, fmt.Errorf("tool result update output %d: %w", index, err)
+			}
+			blocks = append(blocks, anthropicsdk.ContentBlockParamUnion{OfImage: &image})
+		default:
+			return nil, fmt.Errorf("unsupported tool result kind %q", part.Kind)
+		}
+	}
+	return blocks, nil
 }
 
 func requestImage(value string) (anthropicsdk.ImageBlockParam, error) {

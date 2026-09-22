@@ -225,6 +225,9 @@ func Run(
 	if !workspaceInfo.IsDir() {
 		return fmt.Errorf("workspace %q is not a directory", workspace)
 	}
+	// The workspace may supply provider credentials through .env, but it must
+	// not be able to redirect those credentials to a different endpoint.
+	configuredBaseURL := strings.TrimSpace(getenv(llmBaseURLEnvironment))
 	environment, err := loadDotEnv(filepath.Join(workspace, ".env"))
 	if err != nil {
 		return err
@@ -246,7 +249,6 @@ func Run(
 	if err != nil {
 		return err
 	}
-	configuredBaseURL := strings.TrimSpace(getenv(llmBaseURLEnvironment))
 	if configuredBaseURL == "" {
 		configuredBaseURL = selected.BaseURL
 	}

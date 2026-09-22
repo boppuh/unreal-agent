@@ -48,6 +48,118 @@ func TestClientStreamsMessage(t *testing.T) {
 		response.Output[0].Data.(llm.Message).Text != "subscription works" {
 		t.Fatalf("response = %#v, error = %v", response, err)
 	}
+	var rawUsage struct {
+		OutputTokens int64 `json:"output_tokens"`
+	}
+	if err := json.Unmarshal(response.Usage.Raw, &rawUsage); err != nil || response.Usage.OutputTokens != 3 || rawUsage.OutputTokens != 3 {
+		t.Fatalf("usage = %#v, raw = %s, error = %v", response.Usage, response.Usage.Raw, err)
+	}
+}
+
+func TestClientPreservesStreamedThinkingSignature(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		for _, event := range []struct {
+			name, data string
+		}{
+			{"message_start", `{"type":"message_start","message":{"id":"msg_thinking","type":"message","role":"assistant","model":"claude-test","content":[],"stop_reason":null,"stop_sequence":null,"usage":{"input_tokens":2,"output_tokens":0}}}`},
+			{"content_block_start", `{"type":"content_block_start","index":0,"content_block":{"type":"thinking","thinking":"","signature":""}}`},
+			{"content_block_delta", `{"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"inspect first"}}`},
+			{"content_block_delta", `{"type":"content_block_delta","index":0,"delta":{"type":"signature_delta","signature":"opaque-signature"}}`},
+			{"content_block_stop", `{"type":"content_block_stop","index":0}`},
+			{"content_block_start", `{"type":"content_block_start","index":1,"content_block":{"type":"tool_use","id":"toolu_1","name":"Bash","input":{}}}`},
+			{"content_block_delta", `{"type":"content_block_delta","index":1,"delta":{"type":"input_json_delta","partial_json":"{\"command\":\"pwd\"}"}}`},
+			{"content_block_stop", `{"type":"content_block_stop","index":1}`},
+			{"message_delta", `{"type":"message_delta","delta":{"stop_reason":"tool_use","stop_sequence":null},"usage":{"output_tokens":9,"output_tokens_details":{"thinking_tokens":4}}}`},
+			{"message_stop", `{"type":"message_stop"}`},
+		} {
+			_, _ = fmt.Fprintf(w, "event: %s\ndata: %s\n\n", event.name, event.data)
+		}
+	}))
+	defer server.Close()
+	client, err := NewClient(Config{APIKey: "api-key", BaseURL: server.URL})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+	response, err := client.Respond(t.Context(), llm.Request{
+		Model: llm.Model{ID: "claude-test"},
+		Input: []llm.Item{{Type: llm.ItemMessage, Data: llm.Message{Role: llm.RoleUser, Text: "hello"}}},
+	}, llm.RequestOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(response.Output) != 2 || response.Output[0].Type != llm.ItemReasoning || response.Output[1].Type != llm.ItemToolCall {
+		t.Fatalf("response output = %#v", response.Output)
+	}
+	reasoning := response.Output[0].Data.(llm.Reasoning)
+	if !strings.Contains(string(reasoning.Raw), `"thinking":"inspect first"`) ||
+		!strings.Contains(string(reasoning.Raw), `"signature":"opaque-signature"`) {
+		t.Fatalf("reasoning raw = %s", reasoning.Raw)
+	}
+	if response.Usage.OutputTokens != 9 || response.Usage.ReasoningTokens != 4 {
+		t.Fatalf("usage = %#v", response.Usage)
+	}
+}
+
+func TestStandardClientRejectsCrossOriginRedirects(t *testing.T) {
+	var redirected atomic.Int32
+	target := httptest.NewServer(http.HandlerFunc(func(_ http.ResponseWriter, request *http.Request) {
+		redirected.Add(1)
+		if request.Header.Get("X-Api-Key") != "" {
+			t.Error("API key reached cross-origin redirect target")
+		}
+	}))
+	defer target.Close()
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("X-Api-Key") != "api-key" {
+			t.Errorf("source headers = %#v", r.Header)
+		}
+		http.Redirect(w, r, target.URL, http.StatusTemporaryRedirect)
+	}))
+	defer server.Close()
+	client, err := NewClient(Config{APIKey: "api-key", BaseURL: server.URL, MaxAttempts: new(1)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+	_, err = client.Respond(t.Context(), llm.Request{
+		Model: llm.Model{ID: "claude-test"},
+		Input: []llm.Item{{Type: llm.ItemMessage, Data: llm.Message{Role: llm.RoleUser, Text: "hello"}}},
+	}, llm.RequestOptions{})
+	if err == nil || redirected.Load() != 0 {
+		t.Fatalf("error = %v, redirected requests = %d", err, redirected.Load())
+	}
+}
+
+func TestStandardClientAllowsSameOriginRedirects(t *testing.T) {
+	var server *httptest.Server
+	server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("X-Api-Key") != "api-key" {
+			t.Errorf("headers = %#v", r.Header)
+		}
+		switch r.URL.Path {
+		case "/v1/messages":
+			http.Redirect(w, r, server.URL+"/redirected", http.StatusTemporaryRedirect)
+		case "/redirected":
+			writeMessageSSE(w, "same origin")
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+	client, err := NewClient(Config{APIKey: "api-key", BaseURL: server.URL, MaxAttempts: new(1)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+	response, err := client.Respond(t.Context(), llm.Request{
+		Model: llm.Model{ID: "claude-test"},
+		Input: []llm.Item{{Type: llm.ItemMessage, Data: llm.Message{Role: llm.RoleUser, Text: "hello"}}},
+	}, llm.RequestOptions{})
+	if err != nil || len(response.Output) != 1 || response.Output[0].Data.(llm.Message).Text != "same origin" {
+		t.Fatalf("response = %#v, error = %v", response, err)
+	}
 }
 
 func TestSubscriptionClientUsesOAuthHeadersAndRejectsRedirects(t *testing.T) {
@@ -126,6 +238,9 @@ func TestClientConfiguration(t *testing.T) {
 	}
 	if client, err := NewClient(Config{BaseURL: "https://gateway.example/v1"}); err != nil || client == nil {
 		t.Fatalf("standard custom endpoint rejected: %v", err)
+	}
+	if client, err := NewClient(Config{APIKey: "key", BaseURL: "http://gateway.example/v1"}); err == nil || client != nil {
+		t.Fatalf("standard remote HTTP endpoint accepted: %#v, %v", client, err)
 	}
 }
 

@@ -260,6 +260,51 @@ func TestRunMainUsesLLMConfigurationFromEnvironment(t *testing.T) {
 	}
 }
 
+func TestRunMainIgnoresWorkspaceBaseURLOverride(t *testing.T) {
+	for _, name := range []string{llmBaseURLEnvironment, "OPENAI_API_KEY"} {
+		previous, present := os.LookupEnv(name)
+		if err := os.Unsetenv(name); err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() {
+			if present {
+				_ = os.Setenv(name, previous)
+			} else {
+				_ = os.Unsetenv(name)
+			}
+		})
+	}
+	workspace := t.TempDir()
+	if err := os.WriteFile(filepath.Join(workspace, ".env"), []byte(
+		llmBaseURLEnvironment+"=https://workspace.example/v1\nOPENAI_API_KEY=workspace-secret\n",
+	), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	client := &fakeClient{respond: func(context.Context, llm.Request) (llm.Response, error) {
+		return llm.Response{ID: "response-1", Stop: llm.StopComplete}, nil
+	}}
+	created := false
+	providers := []Provider{{
+		Name: "openai", BaseURL: "https://operator.example/v1", DefaultModel: "test-model", APIKeyEnvironment: "OPENAI_API_KEY",
+		NewClient: func(apiKey, baseURL string, _ int, _ func(string) string) (Client, error) {
+			created = true
+			if apiKey != "workspace-secret" || baseURL != "https://operator.example/v1" {
+				return nil, fmt.Errorf("credentials/base URL = %q, %q", apiKey, baseURL)
+			}
+			return client, nil
+		},
+	}}
+	var stderr strings.Builder
+	code := RunMain(
+		t.Context(), []string{"-workspace", workspace, "-session-directory", t.TempDir()},
+		os.Getenv, os.Environ, strings.NewReader(`{"prompt":"hello"}`), io.Discard, &stderr,
+		Config{Name: "unreal-agent-runner", ParseRequest: parseTestRequest, Providers: providers},
+	)
+	if code != 0 || !created {
+		t.Fatalf("exit = %d, client created = %t, stderr = %q", code, created, stderr.String())
+	}
+}
+
 func TestRunMainExecutesBashToolToCompletion(t *testing.T) {
 	t.Setenv(llmAPIKeyEnvironment, "secret")
 	for _, test := range []struct {

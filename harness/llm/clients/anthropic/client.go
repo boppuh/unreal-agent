@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"net/url"
 	"strings"
+	"time"
 
 	anthropicsdk "github.com/anthropics/anthropic-sdk-go"
 	"github.com/anthropics/anthropic-sdk-go/option"
@@ -19,6 +20,7 @@ const (
 	DefaultMaxAttempts     = 5
 	DefaultMaxOutputTokens = int64(32_000)
 	subscriptionBeta       = "oauth-2025-04-20"
+	responseHeaderTimeout  = 10 * time.Minute
 )
 
 type Config struct {
@@ -94,16 +96,13 @@ func newClient(config Config, subscription bool) (*Client, error) {
 		opts = append(opts, option.WithAuthToken(authToken))
 	}
 
-	httpClient := config.HTTPClient
+	httpClient := redirectRestrictedHTTPClient(config.HTTPClient, subscription)
+	opts = append(opts, option.WithHTTPClient(httpClient))
 	if subscription {
-		httpClient = noRedirectHTTPClient(httpClient)
 		opts = append(opts,
-			option.WithHTTPClient(httpClient),
 			option.WithHeader("anthropic-beta", subscriptionBeta),
 			option.WithHeader("User-Agent", "unreal-agent"),
 		)
-	} else if httpClient != nil {
-		opts = append(opts, option.WithHTTPClient(httpClient))
 	}
 
 	return &Client{
@@ -160,28 +159,73 @@ func validateBaseURL(value string, subscription bool) (string, error) {
 		(parsed.Scheme != "http" && parsed.Scheme != "https") {
 		return "", errors.New("Anthropic base URL must be an HTTP(S) endpoint without credentials, query parameters, or a fragment")
 	}
+	loopback := false
+	if ip := net.ParseIP(parsed.Hostname()); ip != nil {
+		loopback = ip.IsLoopback()
+	}
+	if parsed.Scheme == "http" && !loopback {
+		return "", errors.New("Anthropic base URL must use HTTPS unless it names an explicit loopback IP")
+	}
 	if !subscription {
 		return value, nil
 	}
 	if value == BaseURL {
 		return value, nil
 	}
-	if ip := net.ParseIP(parsed.Hostname()); ip != nil && ip.IsLoopback() {
+	if loopback {
 		return value, nil
 	}
 	return "", errors.New("Anthropic subscription base URL must be https://api.anthropic.com or an explicit loopback IP endpoint")
 }
 
-func noRedirectHTTPClient(source *http.Client) *http.Client {
-	if source == nil {
-		return &http.Client{
-			Transport:     http.DefaultTransport.(*http.Transport).Clone(),
-			CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse },
+func redirectRestrictedHTTPClient(source *http.Client, blockAll bool) *http.Client {
+	client := cloneHTTPClient(source)
+	previous := client.CheckRedirect
+	client.CheckRedirect = func(request *http.Request, via []*http.Request) error {
+		if blockAll || len(via) > 0 && !sameOrigin(via[0].URL, request.URL) {
+			return http.ErrUseLastResponse
 		}
+		if previous != nil {
+			return previous(request, via)
+		}
+		if len(via) >= 10 {
+			return errors.New("stopped after 10 redirects")
+		}
+		return nil
+	}
+	return client
+}
+
+func cloneHTTPClient(source *http.Client) *http.Client {
+	if source == nil {
+		if transport, ok := http.DefaultTransport.(*http.Transport); ok {
+			transport = transport.Clone()
+			transport.ResponseHeaderTimeout = responseHeaderTimeout
+			return &http.Client{Transport: transport}
+		}
+		return &http.Client{Transport: http.DefaultTransport}
 	}
 	copy := *source
-	copy.CheckRedirect = func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
 	return &copy
+}
+
+func sameOrigin(left, right *url.URL) bool {
+	return strings.EqualFold(left.Scheme, right.Scheme) &&
+		strings.EqualFold(left.Hostname(), right.Hostname()) &&
+		effectivePort(left) == effectivePort(right)
+}
+
+func effectivePort(value *url.URL) string {
+	if port := value.Port(); port != "" {
+		return port
+	}
+	if strings.EqualFold(value.Scheme, "https") {
+		return "443"
+	}
+	if strings.EqualFold(value.Scheme, "http") {
+		return "80"
+	}
+	return ""
 }
 
 func validHeaderValue(value string) bool {
