@@ -226,8 +226,16 @@ func Run(
 		return fmt.Errorf("workspace %q is not a directory", workspace)
 	}
 	// The workspace may supply provider credentials through .env, but it must
-	// not be able to redirect those credentials to a different endpoint.
+	// not be able to choose where an operator credential is sent.
 	configuredBaseURL := strings.TrimSpace(getenv(llmBaseURLEnvironment))
+	providerName := strings.TrimSpace(getenv(llmProviderEnvironment))
+	if providerName == "" {
+		providerName = defaultProvider
+	}
+	selected, err := selectProvider(config.Providers, providerName)
+	if err != nil {
+		return err
+	}
 	environment, err := loadDotEnv(filepath.Join(workspace, ".env"))
 	if err != nil {
 		return err
@@ -238,14 +246,6 @@ func Run(
 		}
 	}()
 	maxAttempts, err := resolveMaxAttempts(parsed.MaxAttempts, getenv)
-	if err != nil {
-		return err
-	}
-	providerName := strings.TrimSpace(getenv(llmProviderEnvironment))
-	if providerName == "" {
-		providerName = defaultProvider
-	}
-	selected, err := selectProvider(config.Providers, providerName)
 	if err != nil {
 		return err
 	}
@@ -362,7 +362,7 @@ func Run(
 
 	operations := operation.NewLocalOperationManagerWithEnvironment(
 		runContext,
-		sanitizedToolEnvironment(environ()),
+		sanitizedToolEnvironment(environ(), selected.APIKeyEnvironment),
 		configuredTools.RemoteJobs...,
 	)
 	inputs, err := inbox.New(runContext, restored.ExternalInputIDs)
@@ -548,8 +548,11 @@ func loadDotEnv(path string) (*environmentScope, error) {
 	}
 	scope := &environmentScope{}
 	for name, value := range values {
+		if transportEnvironmentVariable(name) {
+			continue
+		}
 		_, present := os.LookupEnv(name)
-		if present && name != "SANDBOX_EGRESS_PROXY" {
+		if present {
 			continue
 		}
 		if err := scope.set(name, value); err != nil {
@@ -562,6 +565,21 @@ func loadDotEnv(path string) (*environmentScope, error) {
 		}
 	}
 	return scope, nil
+}
+
+func transportEnvironmentVariable(name string) bool {
+	switch strings.ToUpper(strings.TrimSpace(name)) {
+	case "ALL_PROXY",
+		"HTTP_PROXY",
+		"HTTPS_PROXY",
+		"NO_PROXY",
+		"SANDBOX_EGRESS_PROXY",
+		"SSL_CERT_DIR",
+		"SSL_CERT_FILE":
+		return true
+	default:
+		return false
+	}
 }
 
 func (scope *environmentScope) set(name, value string) error {
@@ -640,11 +658,19 @@ func validateRequest(parsed Request) ([]RequestMessage, error) {
 	return parsed.Messages, nil
 }
 
-func sanitizedToolEnvironment(environment []string) []string {
+func sanitizedToolEnvironment(environment []string, additionalSensitiveNames ...string) []string {
+	additional := make(map[string]struct{}, len(additionalSensitiveNames))
+	for _, name := range additionalSensitiveNames {
+		name = strings.ToUpper(strings.TrimSpace(name))
+		if name != "" {
+			additional[name] = struct{}{}
+		}
+	}
 	filtered := make([]string, 0, len(environment))
 	for _, entry := range environment {
 		name, _, exists := strings.Cut(entry, "=")
-		if !exists || sensitiveToolEnvironmentVariable(name) {
+		_, explicitlySensitive := additional[strings.ToUpper(strings.TrimSpace(name))]
+		if !exists || explicitlySensitive || sensitiveToolEnvironmentVariable(name) {
 			continue
 		}
 		filtered = append(filtered, entry)

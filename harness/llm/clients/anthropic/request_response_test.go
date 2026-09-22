@@ -13,7 +13,7 @@ import (
 func TestRequestParamsConvertsConversation(t *testing.T) {
 	maxTokens := int64(4096)
 	request := llm.Request{
-		Model: llm.Model{ID: "claude-test", MaxOutputTokens: &maxTokens, ReasoningEffort: llm.ReasoningEffortXHigh},
+		Model: llm.Model{ID: "claude-opus-4-8", MaxOutputTokens: &maxTokens, ReasoningEffort: llm.ReasoningEffortXHigh},
 		Input: []llm.Item{
 			{Type: llm.ItemMessage, Data: llm.Message{Role: llm.RoleSystem, Text: "Be exact."}},
 			{Type: llm.ItemMessage, Data: llm.Message{Role: llm.RoleUser, Text: "inspect"}},
@@ -27,7 +27,8 @@ func TestRequestParamsConvertsConversation(t *testing.T) {
 		Tools: []llm.Tool{{
 			Type: llm.ToolFunction, Name: "Bash", Description: "Run a command",
 			Parameters: map[string]any{
-				"type": "object", "properties": map[string]any{"command": map[string]any{"type": "string"}}, "required": []any{"command"},
+				"type": "object", "properties": map[string]any{"command": map[string]any{"type": "string"}},
+				"required": []any{"command"}, "additionalProperties": false,
 			},
 		}},
 	}
@@ -43,10 +44,10 @@ func TestRequestParamsConvertsConversation(t *testing.T) {
 	if err := json.Unmarshal(encoded, &body); err != nil {
 		t.Fatal(err)
 	}
-	if body["model"] != "claude-test" || body["max_tokens"] != float64(4096) {
+	if body["model"] != "claude-opus-4-8" || body["max_tokens"] != float64(4096) {
 		t.Fatalf("model request = %s", encoded)
 	}
-	if body["cache_control"].(map[string]any)["type"] != "ephemeral" || body["output_config"].(map[string]any)["effort"] != "max" ||
+	if body["cache_control"].(map[string]any)["type"] != "ephemeral" || body["output_config"].(map[string]any)["effort"] != "xhigh" ||
 		body["thinking"].(map[string]any)["type"] != "adaptive" {
 		t.Fatalf("cache/effort = %s", encoded)
 	}
@@ -68,8 +69,42 @@ func TestRequestParamsConvertsConversation(t *testing.T) {
 		t.Fatalf("tool result = %#v", result)
 	}
 	tools := body["tools"].([]any)
-	if len(tools) != 1 || tools[0].(map[string]any)["description"] != "Run a command" {
+	schema := tools[0].(map[string]any)["input_schema"].(map[string]any)
+	if len(tools) != 1 || tools[0].(map[string]any)["description"] != "Run a command" ||
+		len(schema["required"].([]any)) != 1 || schema["additionalProperties"] != false {
 		t.Fatalf("tools = %#v", tools)
+	}
+}
+
+func TestRequestParamsUsesModelThinkingCapabilities(t *testing.T) {
+	for _, test := range []struct {
+		model        string
+		wantThinking bool
+	}{
+		{model: "claude-opus-5"},
+		{model: "claude-opus-4-8", wantThinking: true},
+		{model: "claude-opus-4-5"},
+	} {
+		t.Run(test.model, func(t *testing.T) {
+			params, err := requestParams(llm.Request{
+				Model: llm.Model{ID: test.model, ReasoningEffort: llm.ReasoningEffortHigh},
+			}, llm.RequestOptions{})
+			if err != nil {
+				t.Fatal(err)
+			}
+			encoded, err := json.Marshal(params)
+			if err != nil {
+				t.Fatal(err)
+			}
+			var body map[string]any
+			if err := json.Unmarshal(encoded, &body); err != nil {
+				t.Fatal(err)
+			}
+			_, hasThinking := body["thinking"]
+			if hasThinking != test.wantThinking {
+				t.Fatalf("request = %s, thinking present = %t", encoded, hasThinking)
+			}
+		})
 	}
 }
 
@@ -181,6 +216,7 @@ func TestRequestParamsValidatesProviderSpecificValues(t *testing.T) {
 		{name: "model", request: llm.Request{}, match: "model must be set"},
 		{name: "tokens", request: llm.Request{Model: llm.Model{ID: "m", MaxOutputTokens: &zero}}, match: "must be positive"},
 		{name: "effort", request: llm.Request{Model: llm.Model{ID: "m", ReasoningEffort: "extreme"}}, match: "unsupported reasoning effort"},
+		{name: "xhigh model", request: llm.Request{Model: llm.Model{ID: "claude-opus-4-5", ReasoningEffort: llm.ReasoningEffortXHigh}}, match: "does not support xhigh"},
 		{name: "hosted tool", request: llm.Request{Model: llm.Model{ID: "m"}, Tools: []llm.Tool{{Type: llm.ToolHosted, Name: "web_search"}}}, match: "unsupported tool type"},
 		{name: "foreign reasoning", request: llm.Request{Model: llm.Model{ID: "m"}, Input: []llm.Item{{Type: llm.ItemReasoning, Data: llm.Reasoning{Raw: []byte(`{"type":"reasoning"}`)}}}}, match: "unsupported Anthropic reasoning"},
 		{name: "image URL", request: llm.Request{Model: llm.Model{ID: "m"}, Input: []llm.Item{{Type: llm.ItemToolResult, Data: llm.ToolResult{CallID: "c", Output: []llm.ToolResultOutput{{Kind: llm.ToolResultImage, Value: "https://example.com/image.png"}}}}}}, match: "base64 data URL"},

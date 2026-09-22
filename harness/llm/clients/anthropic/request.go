@@ -47,16 +47,47 @@ func requestParams(request llm.Request, options llm.RequestOptions) (anthropicsd
 		if !request.Model.ReasoningEffort.Valid() {
 			return anthropicsdk.MessageNewParams{}, fmt.Errorf("unsupported reasoning effort %q", request.Model.ReasoningEffort)
 		}
-		effort := request.Model.ReasoningEffort
-		if effort == llm.ReasoningEffortXHigh {
-			effort = llm.ReasoningEffortMax
+		if request.Model.ReasoningEffort == llm.ReasoningEffortXHigh && !modelSupportsXHigh(model) {
+			return anthropicsdk.MessageNewParams{}, fmt.Errorf("Anthropic model %q does not support xhigh reasoning effort", model)
 		}
-		params.OutputConfig.Effort = anthropicsdk.OutputConfigEffort(effort)
-		params.Thinking = anthropicsdk.ThinkingConfigParamUnion{
-			OfAdaptive: &anthropicsdk.ThinkingConfigAdaptiveParam{},
+		params.OutputConfig.Effort = anthropicsdk.OutputConfigEffort(request.Model.ReasoningEffort)
+		if modelUsesAdaptiveThinking(model) {
+			params.Thinking = anthropicsdk.ThinkingConfigParamUnion{
+				OfAdaptive: &anthropicsdk.ThinkingConfigAdaptiveParam{},
+			}
 		}
 	}
 	return params, nil
+}
+
+func modelSupportsXHigh(model string) bool {
+	return modelInFamily(model,
+		"claude-fable-5",
+		"claude-mythos-5",
+		"claude-opus-5",
+		"claude-opus-4-8",
+		"claude-opus-4-7",
+		"claude-sonnet-5",
+	)
+}
+
+func modelUsesAdaptiveThinking(model string) bool {
+	return modelInFamily(model,
+		"claude-opus-4-8",
+		"claude-opus-4-7",
+		"claude-opus-4-6",
+		"claude-sonnet-4-6",
+	)
+}
+
+func modelInFamily(model string, families ...string) bool {
+	model = strings.ToLower(strings.TrimSpace(model))
+	for _, family := range families {
+		if model == family || strings.HasPrefix(model, family+"-") {
+			return true
+		}
+	}
+	return false
 }
 
 func requestMessages(items []llm.Item) ([]anthropicsdk.MessageParam, []anthropicsdk.TextBlockParam, error) {
@@ -293,10 +324,7 @@ func requestTools(tools []llm.Tool) ([]anthropicsdk.ToolUnionParam, error) {
 		if err != nil {
 			return nil, fmt.Errorf("tool %d: encode input schema: %w", index, err)
 		}
-		var schema anthropicsdk.ToolInputSchemaParam
-		if err := json.Unmarshal(encoded, &schema); err != nil {
-			return nil, fmt.Errorf("tool %d: decode input schema: %w", index, err)
-		}
+		schema := param.Override[anthropicsdk.ToolInputSchemaParam](json.RawMessage(encoded))
 		tool := anthropicsdk.ToolUnionParamOfTool(schema, source.Name)
 		if source.Description != "" {
 			tool.OfTool.Description = anthropicsdk.String(source.Description)
