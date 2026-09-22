@@ -9,13 +9,14 @@ import (
 )
 
 type LocalOperationManager struct {
-	ctx             context.Context
-	remoteJobs      *remoteJobHandlers
-	adds            chan localAddRequest
-	cancellations   chan localCancelRequest
-	primitiveEvents chan primitives.PrimitiveEvent
-	updates         chan Operation
-	pendingUpdates  []Operation
+	ctx                context.Context
+	processEnvironment []string
+	remoteJobs         *remoteJobHandlers
+	adds               chan localAddRequest
+	cancellations      chan localCancelRequest
+	primitiveEvents    chan primitives.PrimitiveEvent
+	updates            chan Operation
+	pendingUpdates     []Operation
 }
 
 type localAddRequest struct {
@@ -62,13 +63,33 @@ func (current *localRunningOperation) initialize() error {
 var _ Manager = (*LocalOperationManager)(nil)
 
 func NewLocalOperationManager(ctx context.Context, remoteJobHandlers ...RemoteJobHandler) *LocalOperationManager {
+	return newLocalOperationManager(ctx, nil, remoteJobHandlers...)
+}
+
+// NewLocalOperationManagerWithEnvironment provides the environment inherited by
+// local processes without persisting it in operation state.
+func NewLocalOperationManagerWithEnvironment(
+	ctx context.Context,
+	environment []string,
+	remoteJobHandlers ...RemoteJobHandler,
+) *LocalOperationManager {
+	if environment == nil {
+		environment = []string{}
+	}
+	copied := make([]string, len(environment))
+	copy(copied, environment)
+	return newLocalOperationManager(ctx, copied, remoteJobHandlers...)
+}
+
+func newLocalOperationManager(ctx context.Context, environment []string, remoteJobHandlers ...RemoteJobHandler) *LocalOperationManager {
 	manager := &LocalOperationManager{
-		ctx:             ctx,
-		remoteJobs:      newRemoteJobHandlers(ctx, remoteJobHandlers),
-		adds:            make(chan localAddRequest),
-		cancellations:   make(chan localCancelRequest),
-		primitiveEvents: make(chan primitives.PrimitiveEvent),
-		updates:         make(chan Operation),
+		ctx:                ctx,
+		processEnvironment: environment,
+		remoteJobs:         newRemoteJobHandlers(ctx, remoteJobHandlers),
+		adds:               make(chan localAddRequest),
+		cancellations:      make(chan localCancelRequest),
+		primitiveEvents:    make(chan primitives.PrimitiveEvent),
+		updates:            make(chan Operation),
 	}
 	go manager.run()
 	return manager
@@ -271,7 +292,7 @@ func (manager *LocalOperationManager) acceptLocalStep(
 	}
 	started := 0
 	for _, dispatch := range step.Dispatches {
-		if err := startLocalPrimitive(current.ctx, dispatch, manager.primitiveEvents); err != nil {
+		if err := manager.startLocalPrimitive(current.ctx, dispatch); err != nil {
 			failed, advanceErr := current.handle(&primitives.PrimitiveEvent{
 				Type:   primitives.PrimitiveEventFailed,
 				Source: primitives.SourceID(current.operation.ID),
@@ -286,6 +307,21 @@ func (manager *LocalOperationManager) acceptLocalStep(
 		started++
 	}
 	return started
+}
+
+func (manager *LocalOperationManager) startLocalPrimitive(ctx context.Context, dispatch PrimitiveDispatch) error {
+	if dispatch.Type == primitives.PrimitiveDispatchProcessStart && manager.processEnvironment != nil {
+		request, ok := dispatch.Data.(primitives.ProcessStartRequest)
+		if !ok {
+			return fmt.Errorf("process.start dispatch data is %T, want primitives.ProcessStartRequest", dispatch.Data)
+		}
+		if request.Environment == nil {
+			request.Environment = make([]string, len(manager.processEnvironment))
+			copy(request.Environment, manager.processEnvironment)
+			dispatch.Data = request
+		}
+	}
+	return startLocalPrimitive(ctx, dispatch, manager.primitiveEvents)
 }
 
 func (manager *LocalOperationManager) failLocalOperation(

@@ -77,6 +77,7 @@ description: Review code.
 			],
 			"system_prompt":"be concise",
 			"model":"gpt-test",
+			"max_output_tokens":1234,
 			"thinking_level":"medium"
 		}`),
 		&stdout,
@@ -87,7 +88,7 @@ description: Review code.
 		t.Fatalf("exit = %d, stderr = %q, stdout = %q", code, stderr.String(), stdout.String())
 	}
 	request := <-requests
-	if request.Model.ID != "gpt-test" || request.Model.ReasoningEffort != llm.ReasoningEffortMedium {
+	if request.Model.ID != "gpt-test" || request.Model.MaxOutputTokens == nil || *request.Model.MaxOutputTokens != 1234 || request.Model.ReasoningEffort != llm.ReasoningEffortMedium {
 		t.Fatalf("model = %#v", request.Model)
 	}
 	wantMessages := []llm.Message{
@@ -385,6 +386,25 @@ func TestRunMainEmitsValidationError(t *testing.T) {
 	}
 	if !strings.Contains(stderr.String(), "thinking_level must be one of") {
 		t.Fatalf("stderr = %q", stderr.String())
+	}
+}
+
+func TestSanitizedToolEnvironmentRemovesLLMCredentials(t *testing.T) {
+	environment := []string{
+		"PATH=/usr/bin:/bin",
+		"UNREAL_HARNESS_LLM_API_KEY=generic",
+		"ANTHROPIC_API_KEY=anthropic",
+		"ANTHROPIC_PROFILE=profile",
+		"CLAUDE_CODE_OAUTH_TOKEN=oauth",
+		"OPENAI_API_KEY=openai",
+		"OPENAI_CODEX_ACCESS_TOKEN=codex",
+		"OPENROUTER_API_KEY=router",
+		"FIREWORKS_API_KEY=fireworks",
+		"PROJECT_SETTING=visible",
+	}
+	want := []string{"PATH=/usr/bin:/bin", "PROJECT_SETTING=visible"}
+	if got := sanitizedToolEnvironment(environment); !slices.Equal(got, want) {
+		t.Fatalf("sanitized environment = %#v, want %#v", got, want)
 	}
 }
 

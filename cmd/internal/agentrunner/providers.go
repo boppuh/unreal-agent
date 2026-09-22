@@ -1,6 +1,7 @@
 package agentrunner
 
 import (
+	"github.com/unreallabsai/unreal-agent/harness/llm/clients/anthropic"
 	"github.com/unreallabsai/unreal-agent/harness/llm/clients/fireworks"
 	"github.com/unreallabsai/unreal-agent/harness/llm/clients/ollama"
 	"github.com/unreallabsai/unreal-agent/harness/llm/clients/openai"
@@ -10,6 +11,26 @@ import (
 
 func DefaultProviders() []Provider {
 	return []Provider{
+		{
+			Name:         "anthropic",
+			BaseURL:      anthropic.BaseURL,
+			DefaultModel: "claude-opus-5",
+			NewClient: func(_, baseURL string, maxAttempts int, getenv func(string) string) (Client, error) {
+				config := anthropic.EnvironmentConfig(getenv)
+				config.BaseURL, config.MaxAttempts = baseURL, &maxAttempts
+				return anthropic.NewClient(config)
+			},
+		},
+		{
+			Name:         "anthropic-subscription",
+			BaseURL:      anthropic.BaseURL,
+			DefaultModel: "claude-opus-5",
+			NewClient: func(_, baseURL string, maxAttempts int, getenv func(string) string) (Client, error) {
+				config := anthropic.SubscriptionEnvironmentConfig(getenv)
+				config.BaseURL, config.MaxAttempts = baseURL, &maxAttempts
+				return anthropic.NewSubscriptionClient(config)
+			},
+		},
 		{
 			Name:    "ollama",
 			BaseURL: ollama.BaseURL,

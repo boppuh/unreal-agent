@@ -67,6 +67,7 @@ type Request struct {
 	Prompt                 *string          `json:"prompt"`
 	SystemPrompt           *string          `json:"system_prompt"`
 	Model                  string           `json:"model"`
+	MaxOutputTokens        *int64           `json:"max_output_tokens"`
 	MaxAttempts            *int             `json:"max_attempts"`
 	SessionID              *string          `json:"session_id"`
 	ThinkingLevel          string           `json:"thinking_level"`
@@ -357,7 +358,11 @@ func Run(
 		}
 	}
 
-	operations := operation.NewLocalOperationManager(runContext, configuredTools.RemoteJobs...)
+	operations := operation.NewLocalOperationManagerWithEnvironment(
+		runContext,
+		sanitizedToolEnvironment(environ()),
+		configuredTools.RemoteJobs...,
+	)
 	inputs, err := inbox.New(runContext, restored.ExternalInputIDs)
 	if err != nil {
 		return fmt.Errorf("open inbox: %w", err)
@@ -407,6 +412,7 @@ func Run(
 	builder := contextbuilder.NewBuilder(registry.Skills()...)
 	builder.SetModel(llm.Model{
 		ID:              model,
+		MaxOutputTokens: parsed.MaxOutputTokens,
 		ReasoningEffort: reasoningEffort(parsed.ThinkingLevel),
 	})
 	systemPrompt := defaultSystemPrompt
@@ -598,6 +604,9 @@ func validateRequest(parsed Request) ([]RequestMessage, error) {
 			return nil, errors.New("thinking_level must be one of: low, medium, high, xhigh, max")
 		}
 	}
+	if parsed.MaxOutputTokens != nil && *parsed.MaxOutputTokens <= 0 {
+		return nil, errors.New("max_output_tokens must be positive")
+	}
 	for _, name := range append(parsed.ExtraAllowedTools, parsed.DisallowedTools...) {
 		if strings.TrimSpace(name) == "" {
 			return nil, errors.New("tool names must not be empty")
@@ -627,6 +636,35 @@ func validateRequest(parsed Request) ([]RequestMessage, error) {
 		}
 	}
 	return parsed.Messages, nil
+}
+
+func sanitizedToolEnvironment(environment []string) []string {
+	filtered := make([]string, 0, len(environment))
+	for _, entry := range environment {
+		name, _, exists := strings.Cut(entry, "=")
+		if !exists || sensitiveToolEnvironmentVariable(name) {
+			continue
+		}
+		filtered = append(filtered, entry)
+	}
+	return filtered
+}
+
+func sensitiveToolEnvironmentVariable(name string) bool {
+	name = strings.ToUpper(strings.TrimSpace(name))
+	if strings.HasPrefix(name, "ANTHROPIC_") || strings.HasPrefix(name, "CLAUDE_CODE_OAUTH_") ||
+		strings.HasPrefix(name, "OPENAI_CODEX_") {
+		return true
+	}
+	switch name {
+	case llmAPIKeyEnvironment,
+		"OPENAI_API_KEY",
+		"OPENROUTER_API_KEY",
+		"FIREWORKS_API_KEY":
+		return true
+	default:
+		return false
+	}
 }
 
 func reasoningEffort(level string) llm.ReasoningEffort {

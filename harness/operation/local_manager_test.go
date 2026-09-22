@@ -37,6 +37,42 @@ func TestLocalOperationManagerRunsShellOperation(t *testing.T) {
 	}
 }
 
+func TestLocalOperationManagerUsesExplicitProcessEnvironment(t *testing.T) {
+	t.Setenv("VALUE", "parent")
+	manager := operation.NewLocalOperationManagerWithEnvironment(t.Context(), []string{"VALUE=isolated"})
+	current := newShellOperation(t, "local-shell-environment", operation.ShellInput{
+		Shell:   testShellPath,
+		Command: `printf '%s' "$VALUE"`,
+	}, t.TempDir(), 64)
+
+	if err := manager.Add(current); err != nil {
+		t.Fatal(err)
+	}
+	completed := receiveTerminalOperation(t, manager.Updates(), current.ID)
+	state := shellState(t, completed)
+	if completed.Status != operation.StatusCompleted || state.Result == nil || state.Result.Out != "isolated" {
+		t.Fatalf("operation = %#v, state = %#v", completed, state)
+	}
+}
+
+func TestLocalOperationManagerCanClearProcessEnvironment(t *testing.T) {
+	t.Setenv("INHERITED_SECRET", "must-not-inherit")
+	manager := operation.NewLocalOperationManagerWithEnvironment(t.Context(), nil)
+	current := newShellOperation(t, "local-shell-empty-environment", operation.ShellInput{
+		Shell:   testShellPath,
+		Command: `printf '%s' "${INHERITED_SECRET-unset}"`,
+	}, t.TempDir(), 64)
+
+	if err := manager.Add(current); err != nil {
+		t.Fatal(err)
+	}
+	completed := receiveTerminalOperation(t, manager.Updates(), current.ID)
+	state := shellState(t, completed)
+	if completed.Status != operation.StatusCompleted || state.Result == nil || state.Result.Out != "unset" {
+		t.Fatalf("operation = %#v, state = %#v", completed, state)
+	}
+}
+
 func TestLocalOperationManagerRunsMultipleShellOperations(t *testing.T) {
 	manager := operation.NewLocalOperationManager(t.Context())
 	baseDirectory := t.TempDir()

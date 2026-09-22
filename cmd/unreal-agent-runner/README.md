@@ -36,8 +36,32 @@ unreal-agent-runner < request.json
 ```
 
 OpenAI is the default provider. Set `UNREAL_HARNESS_LLM_PROVIDER` to `openai`,
-`openai-codex`, `openrouter`, `fireworks`, or `ollama`, and
+`openai-codex`, `anthropic`, `anthropic-subscription`, `openrouter`, `fireworks`,
+or `ollama`, and
 `UNREAL_HARNESS_LLM_MODEL` to choose a model.
+
+Use Anthropic with an API key, an `ant auth login` profile, or workload identity:
+
+```sh
+export UNREAL_HARNESS_LLM_PROVIDER=anthropic
+export ANTHROPIC_API_KEY="..." # omit when using a profile or workload identity
+unreal-agent-runner -p 'Inspect this project.'
+```
+
+To use a Claude Code subscription token created by `claude setup-token`, select
+the subscription provider explicitly so it cannot silently fall back to API
+billing:
+
+```sh
+export UNREAL_HARNESS_LLM_PROVIDER=anthropic-subscription
+export CLAUDE_CODE_OAUTH_TOKEN="..."
+unreal-agent-runner -p 'Inspect this project.'
+```
+
+Anthropic requests default to `claude-opus-5` and 32,000 output tokens. Override
+those with `UNREAL_HARNESS_LLM_MODEL` and the JSON request field
+`max_output_tokens`. LLM credentials are removed from the environment inherited
+by Bash tool processes.
 
 Run `unreal-agent-runner -h` for options and the JSON request fields.
 
