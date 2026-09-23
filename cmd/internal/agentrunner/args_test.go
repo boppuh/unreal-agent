@@ -85,6 +85,7 @@ func TestRunMainRejectsInvalidRequestArguments(t *testing.T) {
 		{name: "unknown field", args: []string{`{"prompt":"hello","unknown":true}`}, want: "unknown object member"},
 		{name: "empty argument", args: []string{""}, want: "empty input"},
 		{name: "invalid request", args: []string{`{"messages":[]}`}, want: "messages must not be empty"},
+		{name: "invalid max output", args: []string{`{"prompt":"hello","max_output_tokens":0}`}, want: "max_output_tokens must be positive"},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			var stdout, stderr bytes.Buffer
@@ -164,7 +165,7 @@ func TestRunMainHelp(t *testing.T) {
 			for _, want := range []string{
 				"test-runner [options] < request.json", "test-runner [options] 'JSON request'", "test-runner [options] -p 'prompt'",
 				"-p prompt", "-workspace", "-session-directory", "-log-directory", "-tool-heartbeat-interval",
-				"Request schema", "messages:", "role:", "content:", "message_id?:", "prompt:", "model:", "max_attempts:",
+				"Request schema", "messages:", "role:", "content:", "message_id?:", "prompt:", "model:", "max_output_tokens:", "max_attempts:",
 				"system_prompt:", "thinking_level:", "session_id:", "disallowed_tools:", "extra_allowed_tools:", "include_partial_messages:",
 			} {
 				if !strings.Contains(stderr.String(), want) {

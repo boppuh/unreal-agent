@@ -15,6 +15,8 @@ Request schema (JSON object; unknown fields are rejected):
     Supply messages or prompt. messages takes precedence when both are present.
   model: string (optional)
     Provider model ID; defaults to UNREAL_HARNESS_LLM_MODEL or the provider default.
+  max_output_tokens: positive integer (optional)
+    Provider output-token limit. Anthropic defaults to 32000 when omitted.
   max_attempts: positive integer (optional)
     Overrides UNREAL_HARNESS_LLM_MAX_ATTEMPTS (default 5); 1 disables retries.
   system_prompt: string (optional)

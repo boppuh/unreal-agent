@@ -77,6 +77,7 @@ description: Review code.
 			],
 			"system_prompt":"be concise",
 			"model":"gpt-test",
+			"max_output_tokens":1234,
 			"thinking_level":"medium"
 		}`),
 		&stdout,
@@ -87,7 +88,7 @@ description: Review code.
 		t.Fatalf("exit = %d, stderr = %q, stdout = %q", code, stderr.String(), stdout.String())
 	}
 	request := <-requests
-	if request.Model.ID != "gpt-test" || request.Model.ReasoningEffort != llm.ReasoningEffortMedium {
+	if request.Model.ID != "gpt-test" || request.Model.MaxOutputTokens == nil || *request.Model.MaxOutputTokens != 1234 || request.Model.ReasoningEffort != llm.ReasoningEffortMedium {
 		t.Fatalf("model = %#v", request.Model)
 	}
 	wantMessages := []llm.Message{
@@ -259,6 +260,52 @@ func TestRunMainUsesLLMConfigurationFromEnvironment(t *testing.T) {
 	}
 }
 
+func TestRunMainIgnoresWorkspaceProviderAndBaseURLOverrides(t *testing.T) {
+	for _, name := range []string{llmBaseURLEnvironment, llmProviderEnvironment, "OPENAI_API_KEY"} {
+		previous, present := os.LookupEnv(name)
+		if err := os.Unsetenv(name); err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() {
+			if present {
+				_ = os.Setenv(name, previous)
+			} else {
+				_ = os.Unsetenv(name)
+			}
+		})
+	}
+	workspace := t.TempDir()
+	if err := os.WriteFile(filepath.Join(workspace, ".env"), []byte(
+		llmBaseURLEnvironment+"=https://workspace.example/v1\n"+
+			llmProviderEnvironment+"=workspace-provider\nOPENAI_API_KEY=workspace-secret\n",
+	), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	client := &fakeClient{respond: func(context.Context, llm.Request) (llm.Response, error) {
+		return llm.Response{ID: "response-1", Stop: llm.StopComplete}, nil
+	}}
+	created := false
+	providers := []Provider{{
+		Name: "openai", BaseURL: "https://operator.example/v1", DefaultModel: "test-model", APIKeyEnvironment: "OPENAI_API_KEY",
+		NewClient: func(apiKey, baseURL string, _ int, _ func(string) string) (Client, error) {
+			created = true
+			if apiKey != "workspace-secret" || baseURL != "https://operator.example/v1" {
+				return nil, fmt.Errorf("credentials/base URL = %q, %q", apiKey, baseURL)
+			}
+			return client, nil
+		},
+	}}
+	var stderr strings.Builder
+	code := RunMain(
+		t.Context(), []string{"-workspace", workspace, "-session-directory", t.TempDir()},
+		os.Getenv, os.Environ, strings.NewReader(`{"prompt":"hello"}`), io.Discard, &stderr,
+		Config{Name: "unreal-agent-runner", ParseRequest: parseTestRequest, Providers: providers},
+	)
+	if code != 0 || !created {
+		t.Fatalf("exit = %d, client created = %t, stderr = %q", code, created, stderr.String())
+	}
+}
+
 func TestRunMainExecutesBashToolToCompletion(t *testing.T) {
 	t.Setenv(llmAPIKeyEnvironment, "secret")
 	for _, test := range []struct {
@@ -388,6 +435,26 @@ func TestRunMainEmitsValidationError(t *testing.T) {
 	}
 }
 
+func TestSanitizedToolEnvironmentRemovesLLMCredentials(t *testing.T) {
+	environment := []string{
+		"PATH=/usr/bin:/bin",
+		"UNREAL_HARNESS_LLM_API_KEY=generic",
+		"ANTHROPIC_API_KEY=anthropic",
+		"ANTHROPIC_PROFILE=profile",
+		"CLAUDE_CODE_OAUTH_TOKEN=oauth",
+		"OPENAI_API_KEY=openai",
+		"OPENAI_CODEX_ACCESS_TOKEN=codex",
+		"OPENROUTER_API_KEY=router",
+		"FIREWORKS_API_KEY=fireworks",
+		"CUSTOM_CREDENTIAL=custom",
+		"PROJECT_SETTING=visible",
+	}
+	want := []string{"PATH=/usr/bin:/bin", "PROJECT_SETTING=visible"}
+	if got := sanitizedToolEnvironment(environment, "CUSTOM_CREDENTIAL"); !slices.Equal(got, want) {
+		t.Fatalf("sanitized environment = %#v, want %#v", got, want)
+	}
+}
+
 func TestValidateRequestRejectsNonUUIDMessageID(t *testing.T) {
 	messageID := "message-1"
 	_, err := validateRequest(Request{
@@ -416,10 +483,10 @@ func TestLoadDotEnvUsesScopedOverrides(t *testing.T) {
 	if got := os.Getenv("HARNESS_RUNNER_EXISTING"); got != "outer" {
 		t.Fatalf("existing value = %q", got)
 	}
-	if got := os.Getenv("SANDBOX_EGRESS_PROXY"); got != "https://proxy.example" {
+	if got := os.Getenv("SANDBOX_EGRESS_PROXY"); got != "outer-proxy" {
 		t.Fatalf("proxy value = %q", got)
 	}
-	if got := os.Getenv("HTTPS_PROXY"); got != "https://proxy.example" {
+	if got := os.Getenv("HTTPS_PROXY"); got != "outer-proxy" {
 		t.Fatalf("HTTPS proxy value = %q", got)
 	}
 	if err := scope.Close(); err != nil {
@@ -430,6 +497,70 @@ func TestLoadDotEnvUsesScopedOverrides(t *testing.T) {
 	}
 	if got := os.Getenv("HTTPS_PROXY"); got != "outer-https" {
 		t.Fatalf("restored HTTPS proxy value = %q", got)
+	}
+}
+
+func TestLoadDotEnvIgnoresTransportSettings(t *testing.T) {
+	const visibleName = "HARNESS_RUNNER_VISIBLE"
+	names := []string{
+		"ALL_PROXY",
+		"HTTP_PROXY",
+		"HTTPS_PROXY",
+		"NO_PROXY",
+		"SANDBOX_EGRESS_PROXY",
+		"SSL_CERT_DIR",
+		"SSL_CERT_FILE",
+	}
+	for _, name := range names {
+		previous, present := os.LookupEnv(name)
+		if err := os.Unsetenv(name); err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() {
+			if present {
+				_ = os.Setenv(name, previous)
+			} else {
+				_ = os.Unsetenv(name)
+			}
+		})
+	}
+	previousVisible, visiblePresent := os.LookupEnv(visibleName)
+	if err := os.Unsetenv(visibleName); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if visiblePresent {
+			_ = os.Setenv(visibleName, previousVisible)
+		} else {
+			_ = os.Unsetenv(visibleName)
+		}
+	})
+	path := filepath.Join(t.TempDir(), ".env")
+	var contents strings.Builder
+	for _, name := range names {
+		fmt.Fprintf(&contents, "%s=workspace-value\n", name)
+	}
+	fmt.Fprintf(&contents, "%s=visible\n", visibleName)
+	if err := os.WriteFile(path, []byte(contents.String()), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	scope, err := loadDotEnv(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, name := range names {
+		if _, present := os.LookupEnv(name); present {
+			t.Errorf("workspace transport setting %s was loaded", name)
+		}
+	}
+	if got := os.Getenv(visibleName); got != "visible" {
+		t.Fatalf("ordinary workspace setting = %q", got)
+	}
+	if err := scope.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if _, present := os.LookupEnv(visibleName); present {
+		t.Fatal("ordinary workspace setting was not restored")
 	}
 }
 
